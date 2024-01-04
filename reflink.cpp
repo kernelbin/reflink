@@ -10,7 +10,10 @@
 #include <algorithm>
 #include "reflink.h"
 #include <crtdbg.h>
+#include <pathcch.h>
+#include <atlcoll.h>
 
+#pragma comment(lib, "pathcch.lib")
 constexpr LONG64 inline ROUNDUP(LONG64 file_size, ULONG cluster_size) noexcept
 {
 	return (file_size + cluster_size - 1) / cluster_size * cluster_size;
@@ -124,4 +127,208 @@ bool reflink(_In_z_ PCWSTR oldpath, _In_z_ PCWSTR newpath)
 	}
 	dispose = { FALSE };
 	return !!SetFileInformationByHandle(destination, FileDispositionInfo, &dispose, sizeof dispose);
+}
+
+
+bool reflink_relative_path(_In_z_ PCWSTR old_base, _In_z_ PCWSTR new_base, _In_z_ PCWSTR relative_path)
+{
+	bool bsuccess = true;
+	PWSTR oldpath = nullptr, newpath = nullptr;
+	if (FAILED(PathAllocCombine(old_base, relative_path, PATHCCH_ALLOW_LONG_PATHS, &oldpath)))
+	{
+		bsuccess = false;
+		goto leave;
+	}
+	if (FAILED(PathAllocCombine(new_base, relative_path, PATHCCH_ALLOW_LONG_PATHS, &newpath)))
+	{
+		bsuccess = false;
+		goto leave;
+	}
+	bsuccess = reflink(oldpath, newpath);
+leave:
+	if (oldpath) LocalFree(oldpath);
+	if (newpath) LocalFree(newpath);
+	return bsuccess;
+}
+
+// creating dir1\dir2\dir3 will create dir1 and dir2 if they do not already exist.
+// TODO: this implement is a little bit memory wasting...
+BOOL CreateDirectoryRecursively(_In_z_ LPCWSTR path)
+{
+	LPWSTR new_path = nullptr;
+	BOOL ret = TRUE;
+
+	int buffer_len = (lstrlenW(path) + 1);
+	new_path = (LPWSTR)HeapAlloc(GetProcessHeap(), 0, sizeof(WCHAR) * buffer_len);
+	if (!new_path)
+		return FALSE;
+	lstrcpyW(new_path, path);
+
+	PathCchRemoveBackslash(new_path, buffer_len);
+
+	while (!CreateDirectoryW(path, NULL))
+	{
+		DWORD last_error = GetLastError();
+		if (last_error == ERROR_ALREADY_EXISTS)
+			break;
+
+		if (last_error != ERROR_PATH_NOT_FOUND)
+		{
+			ret = FALSE;
+			break;
+		}
+
+		if (PathCchRemoveFileSpec(new_path, buffer_len) != S_OK)
+		{
+			ret = FALSE;
+			break;
+		}
+
+		if (!CreateDirectoryRecursively(new_path))
+		{
+			ret = FALSE;
+			break;
+		}
+	}
+	HeapFree(GetProcessHeap(), 0, new_path);
+	return ret;
+}
+
+BOOL CreateRelativeDirectoryRecursively(_In_z_ LPCWSTR base_path, _In_z_ LPCWSTR relative_path)
+{
+	BOOL bSuccess = TRUE;
+	LPWSTR fullpath = nullptr;
+	if (FAILED(PathAllocCombine(base_path, relative_path, PATHCCH_ALLOW_LONG_PATHS, &fullpath)))
+	{
+		bSuccess = FALSE;
+		goto leave;
+	}
+
+	bSuccess = CreateDirectoryRecursively(fullpath);
+leave:
+	if (fullpath) LocalFree(fullpath);
+	return bSuccess;
+}
+
+_Success_(return != INVALID_HANDLE_VALUE)
+HANDLE
+WINAPI
+FindFirstFileInDirectory(
+	_In_ LPCWSTR lpBasePath,
+	_In_ LPCWSTR lpRelativePath,
+	_In_ FINDEX_INFO_LEVELS fInfoLevelId,
+	_Out_writes_bytes_(sizeof(WIN32_FIND_DATAW)) LPVOID lpFindFileData,
+	_In_ FINDEX_SEARCH_OPS fSearchOp,
+	_Reserved_ LPVOID lpSearchFilter,
+	_In_ DWORD dwAdditionalFlags
+)
+{
+	HANDLE Ret = INVALID_HANDLE_VALUE;
+
+	LPWSTR AbsoluteDirPath = nullptr;
+	LPWSTR SearchPattern = nullptr;
+	if (FAILED(PathAllocCombine(lpBasePath, lpRelativePath, PATHCCH_ALLOW_LONG_PATHS, &AbsoluteDirPath)))
+	{
+		goto leave;
+	}
+	if (FAILED(PathAllocCombine(AbsoluteDirPath, L"*", PATHCCH_ALLOW_LONG_PATHS, &SearchPattern)))
+	{
+		goto leave;
+	}
+
+	Ret = FindFirstFileExW(SearchPattern, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+
+leave:
+	if (AbsoluteDirPath)
+	{
+		LocalFree(AbsoluteDirPath);
+	}
+	if (SearchPattern)
+	{
+		LocalFree(SearchPattern);
+	}
+	return Ret;
+}
+
+// by bfs
+EXTERN_C
+_Success_(return == true)
+bool recursive_reflink(_In_z_ PCWSTR old_folder_path, _In_z_ PCWSTR new_folder_path)
+{
+	UNREFERENCED_PARAMETER(new_folder_path);
+	WIN32_FIND_DATAW find_data;
+	ATL::CAtlList<PWSTR> paths_to_search;
+	PWSTR search_path = nullptr;
+	PWSTR relative_path = nullptr;
+	bool bSuccess = true;
+
+	paths_to_search.AddTail((LPWSTR)LocalAlloc(LMEM_ZEROINIT, 1));
+
+	while (!paths_to_search.IsEmpty())
+	{
+		search_path = paths_to_search.RemoveHead();
+
+		CreateRelativeDirectoryRecursively(new_folder_path, search_path);
+		HANDLE hFind = FindFirstFileInDirectory(old_folder_path, search_path, FindExInfoBasic, (LPVOID)&find_data, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+		if (hFind == INVALID_HANDLE_VALUE)
+		{
+			bSuccess = false;
+			goto leave;
+		}
+
+		do
+		{
+			if (find_data.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM)
+				continue;
+			if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			{
+				if (find_data.cFileName[0] == L'.' && (find_data.cFileName[1] == L'\0' || (find_data.cFileName[1] == L'.' && find_data.cFileName[2] == L'\0')))
+					continue;
+				if (FAILED(PathAllocCombine(search_path, find_data.cFileName, PATHCCH_ALLOW_LONG_PATHS, &relative_path)))
+				{
+					bSuccess = false;
+					goto leave;
+				}
+				paths_to_search.AddTail(relative_path);
+				relative_path = nullptr;
+			}
+			else
+			{
+				if (FAILED(PathAllocCombine(search_path, find_data.cFileName, PATHCCH_ALLOW_LONG_PATHS, &relative_path)))
+				{
+					bSuccess = false;
+					goto leave;
+				}
+				reflink_relative_path(old_folder_path, new_folder_path, relative_path);
+				LocalFree(relative_path);
+				relative_path = nullptr;
+			}
+		} while (FindNextFileW(hFind, &find_data));
+
+		FindClose(hFind);
+
+		if (GetLastError() != ERROR_NO_MORE_FILES)
+		{
+			bSuccess = false;
+			goto leave;
+		}
+		LocalFree(search_path);
+		search_path = nullptr;
+	}
+
+leave:
+	if (search_path)
+	{
+		LocalFree(search_path);
+	}
+	if (relative_path)
+	{
+		LocalFree(relative_path);
+	}
+	while (!paths_to_search.IsEmpty())
+	{
+		LocalFree(paths_to_search.RemoveHead());
+	}
+
+	return bSuccess;
 }

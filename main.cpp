@@ -43,17 +43,37 @@ int __cdecl wmain(int argc, PWSTR argv[])
 			"\n"
 			"reflink source destination\n"
 			"\n"
-			"source       Specifies a file to copy.\n"
+			"source       Specifies a file or directory to copy.\n"
 			"             source must have placed on the ReFS volume.\n"
-			"destination  Specifies new file name.\n"
+			"destination  Specifies new file or directory name.\n"
 			"             destination must have placed on the same volume as source.\n",
 			stderr
 		);
 		return EXIT_FAILURE;
 	}
-	if (!reflink(argv[1], argv[2]))
+
+	DWORD dwAttr = GetFileAttributesW(argv[1]);
+	if (!dwAttr)
 	{
 		PrintWindowsError();
 		return EXIT_FAILURE;
+	}
+	if (dwAttr & FILE_ATTRIBUTE_DIRECTORY)
+	{
+		// TODO: check if target directory is a sub-directory of source directory
+
+		if (!recursive_reflink(argv[1], argv[2]))
+		{
+			PrintWindowsError();
+			return EXIT_FAILURE;
+		}
+	}
+	else
+	{
+		if (!reflink(argv[1], argv[2]))
+		{
+			PrintWindowsError();
+			return EXIT_FAILURE;
+		}
 	}
 }
