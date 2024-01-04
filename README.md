@@ -5,12 +5,18 @@ Copy file without actual data write.
 
 reflink source destination
 
-source       Specifies a file to copy.
+source       Specifies a file or directory to copy.
              source must have placed on the ReFS volume.
-destination  Specifies new file name.
+destination  Specifies new file or directory name.
              destination must have placed on the same volume as source.
 
 ```
+
+### Note for reflink a directory
+
+It's implemented by copying entire directory tree and reflink all files under it, not by reflink the directory metadata. (Coz i don't know how to do that, tell me if you know!!)
+**currently it will overwrite existing files**, use with caution
+
 Windows Server 2016 introduce [Block Cloning feature](https://docs.microsoft.com/windows-server/storage/refs/block-cloning).  
 I wanted `cp --reflink`. But, only exposed to API.
 
