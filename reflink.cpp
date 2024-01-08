@@ -166,6 +166,10 @@ BOOL CreateDirectoryRecursively(_In_z_ LPCWSTR path)
 
 	PathCchRemoveBackslash(new_path, buffer_len);
 
+	if (PathCchIsRoot(path))
+	{
+		return TRUE;
+	}
 	while (!CreateDirectoryW(path, NULL))
 	{
 		DWORD last_error = GetLastError();
@@ -194,19 +198,27 @@ BOOL CreateDirectoryRecursively(_In_z_ LPCWSTR path)
 	return ret;
 }
 
-BOOL CreateRelativeDirectoryRecursively(_In_z_ LPCWSTR base_path, _In_z_ LPCWSTR relative_path)
+BOOL CreateRelativeDirectoryEx(_In_z_ LPCWSTR base_path, _In_z_ LPCWSTR template_base, _In_z_ LPCWSTR relative_path)
 {
 	BOOL bSuccess = TRUE;
-	LPWSTR fullpath = nullptr;
-	if (FAILED(PathAllocCombine(base_path, relative_path, PATHCCH_ALLOW_LONG_PATHS, &fullpath)))
+	LPWSTR template_path = nullptr;
+	LPWSTR newdirectory_path = nullptr;
+
+	if (FAILED(PathAllocCombine(base_path, relative_path, PATHCCH_ALLOW_LONG_PATHS, &template_path)))
+	{
+		bSuccess = FALSE;
+		goto leave;
+	}
+	if (FAILED(PathAllocCombine(template_base, relative_path, PATHCCH_ALLOW_LONG_PATHS, &newdirectory_path)))
 	{
 		bSuccess = FALSE;
 		goto leave;
 	}
 
-	bSuccess = CreateDirectoryRecursively(fullpath);
+	bSuccess = CreateDirectoryExW(template_path, newdirectory_path, NULL);
 leave:
-	if (fullpath) LocalFree(fullpath);
+	if (template_path) LocalFree(template_path);
+	if (newdirectory_path) LocalFree(newdirectory_path);
 	return bSuccess;
 }
 
@@ -262,13 +274,39 @@ bool recursive_reflink(_In_z_ PCWSTR old_folder_path, _In_z_ PCWSTR new_folder_p
 	PWSTR relative_path = nullptr;
 	bool bSuccess = true;
 
+	// Ensure parent of new_folder_path exists.
+	SIZE_T new_folder_parent_bufsz = wcslen(new_folder_path) + 1;
+	LPWSTR new_folder_parent = (LPWSTR)HeapAlloc(GetProcessHeap(), 0, sizeof(WCHAR) * new_folder_parent_bufsz);
+	if (!new_folder_parent) goto leave;
+
+	lstrcpyW(new_folder_parent, new_folder_path);
+	switch (PathCchRemoveFileSpec(new_folder_parent, new_folder_parent_bufsz))
+	{
+	case S_OK:
+		// TODO: perhaps expand path fully based on cwd? so user can specify path like ".."
+		if (new_folder_parent[0] && !CreateDirectoryRecursively(new_folder_parent) && GetLastError() != ERROR_ALREADY_EXISTS)
+		{
+			goto leave;
+		}
+		[[fallthrough]];
+	case S_FALSE:
+		break;
+	default:
+		// TODO: handle HRESULT error code
+		goto leave;
+	}
+
 	paths_to_search.AddTail((LPWSTR)LocalAlloc(LMEM_ZEROINIT, 1));
 
 	while (!paths_to_search.IsEmpty())
 	{
 		search_path = paths_to_search.RemoveHead();
 
-		CreateRelativeDirectoryRecursively(new_folder_path, search_path);
+		if (!CreateRelativeDirectoryEx(old_folder_path, new_folder_path, search_path))
+		{
+			// TODO: log error here?
+			continue;
+		}
 		HANDLE hFind = FindFirstFileInDirectory(old_folder_path, search_path, FindExInfoBasic, (LPVOID)&find_data, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
 		if (hFind == INVALID_HANDLE_VALUE)
 		{
@@ -280,6 +318,8 @@ bool recursive_reflink(_In_z_ PCWSTR old_folder_path, _In_z_ PCWSTR new_folder_p
 		{
 			if (find_data.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM)
 				continue;
+			if (find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+				continue; // TODO: this is a temporary workaround
 			if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
 			{
 				if (find_data.cFileName[0] == L'.' && (find_data.cFileName[1] == L'\0' || (find_data.cFileName[1] == L'.' && find_data.cFileName[2] == L'\0')))
@@ -329,6 +369,9 @@ leave:
 	{
 		LocalFree(paths_to_search.RemoveHead());
 	}
-
+	if (new_folder_parent)
+	{
+		HeapFree(GetProcessHeap(), 0, new_folder_parent);
+	}
 	return bSuccess;
 }
